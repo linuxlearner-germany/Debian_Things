@@ -29,6 +29,6 @@ sudo mkdir -p /mnt/medicat
 sudo mount -t ntfs-3g /dev/sda1 /mnt/medicat
 ```
 
-```
+```bash
 test
 ```
