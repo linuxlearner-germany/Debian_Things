@@ -21,7 +21,7 @@ Führe folgende Befehle aus:
 sudo apt update
 sudo apt install ntfs-3g
 sudo ntfsfix /dev/sda1
-
+```bash
 ## 📂 Danach mounten mit
 
 ```bash
