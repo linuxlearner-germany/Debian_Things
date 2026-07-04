@@ -1,251 +1,337 @@
 #!/usr/bin/env bash
-#
-# Automatisches Update-Script für Debian-basierte Systeme (Debian 12/13+)
-# Automatic update script for Debian-based systems (Debian 12/13+)
-#
-# Features:
-#  - apt-get update + upgrade (inkl. Security, wenn security-Repo aktiv ist)
-#  - optional: full-upgrade, Flatpak, needrestart, Auto-Reboot (wenn Marker existiert)
-#  - Logging nach /var/log (Fallback: /tmp)
-#
-# Usage:
-#   sudo ./update.sh
-#   sudo ./update.sh --full
-#   sudo ./update.sh --flatpak
-#   sudo ./update.sh --helpers
-#   sudo ./update.sh --reboot
-#   sudo ./update.sh --help
-#
 
-set -euo pipefail
-IFS=$'\n\t'
+set -o pipefail
 
-# --- Farben / Colors ---
 GREEN='\033[0;32m'
 RED='\033[0;31m'
+YELLOW='\033[1;33m'
 NC='\033[0m'
 
-# --- Print Helpers ---
-g() { printf "%b\n" "${GREEN}$*${NC}"; }  # green
-r() { printf "%b\n" "${RED}$*${NC}"; }    # red
+g() { printf "%b\n" "${GREEN}$*${NC}"; }
+r() { printf "%b\n" "${RED}$*${NC}"; }
+y() { printf "%b\n" "${YELLOW}$*${NC}"; }
 blank() { printf "\n"; }
 
-# --- Defaults ---
-FULL_UPGRADE=0
-DO_FLATPAK=0
-INSTALL_HELPERS=0
-AUTO_REBOOT=0
-
-usage() {
+show_logo() {
+  printf "%b" "$RED"
   cat <<'EOF'
-Usage: sudo ./update.sh [OPTIONS]
-
-Options:
-  --full        Use apt-get full-upgrade (may remove/replace packages)
-  --flatpak     Update Flatpak apps (installs flatpak if missing; adds flathub if needed)
-  --helpers     Install helper tools (needrestart) and run post-checks
-  --reboot      Reboot automatically if a reboot marker file exists
-  --no-reboot   Never reboot automatically (default)
-  -h, --help    Show this help
-
-Notes:
-  - Security updates are included automatically if your Debian security repository is enabled.
-  - This script logs output to /var/log (fallback: /tmp).
+ヽ༼ຈل͜ຈ༽ﾉ
+██╗   ██╗██████╗ ██████╗  █████╗ ████████╗███████╗
+██║   ██║██╔══██╗██╔══██╗██╔══██╗╚══██╔══╝██╔════╝
+██║   ██║██████╔╝██║  ██║███████║   ██║   █████╗
+██║   ██║██╔═══╝ ██║  ██║██╔══██║   ██║   ██╔══╝
+╚██████╔╝██║     ██████╔╝██║  ██║   ██║   ███████╗
+ ╚═════╝ ╚═╝     ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝
 EOF
+  printf "%b\n" "$NC"
 }
 
-for arg in "$@"; do
-  case "$arg" in
-    "") continue ;;
-    --full) FULL_UPGRADE=1 ;;
-    --flatpak) DO_FLATPAK=1 ;;
-    --helpers) INSTALL_HELPERS=1 ;;
-    --reboot) AUTO_REBOOT=1 ;;
-    --no-reboot) AUTO_REBOOT=0 ;;
-    -h|--help) usage; exit 0 ;;
-    *)
-      r "Unbekanntes Argument / Unknown argument: $arg"
-      usage
-      exit 2
-      ;;
+selected_in_list() {
+  local item="$1"
+  local list="$2"
+
+  case " $list " in
+    *" $item "*) return 0 ;;
+    *) return 1 ;;
   esac
-done
-
-# --- Error handler ---
-on_error() {
-  local ec=$?
-  r "FEHLER / ERROR: Exit-Code ${ec}"
-  r "Letzte Zeile / Last line: ${BASH_COMMAND}"
-  exit "$ec"
 }
-trap on_error ERR
 
-# --- Root check ---
-if [[ "${EUID}" -ne 0 ]]; then
-  r "Bitte als root ausführen / Please run as root (sudo)."
+blank
+blank
+show_logo
+g "================== SYSTEM_UPDATE =================="
+
+# ------------------------------------------------------------
+# Root prüfen
+# ------------------------------------------------------------
+
+if [ "$(id -u)" -ne 0 ]; then
+  r "Bitte als root starten:"
+  y "sudo $0"
   exit 1
 fi
 
-# --- Check package manager availability ---
-if ! command -v apt-get >/dev/null 2>&1; then
-  r "Kein 'apt-get' gefunden / No 'apt-get' found."
+# ------------------------------------------------------------
+# Benötigte Programme prüfen
+# ------------------------------------------------------------
+
+if ! command -v apt >/dev/null 2>&1; then
+  r "APT nicht gefunden."
   exit 2
 fi
 
-# --- Banner ---
-blank
-r "ヽ༼ຈل͜ຈ༽ﾉ"
-g "<|START|>"
-g "============1=1=1=1=1=1=1=1=1=1=1=1=1=1=1=1=1=1=================="
-g "#    Automatisches System-Update / Automatic system update      #"
-g "#                           (Debian)                            #"
-g "================================================================="
-blank
-
-# --- Logging ---
-LOGDIR="/var/log"
-LOGFILE="${LOGDIR}/system-update-$(date +%F_%H-%M-%S).log"
-if ! ( touch "$LOGFILE" 2>/dev/null ); then
-  LOGDIR="/tmp"
-  LOGFILE="${LOGDIR}/system-update-$(date +%F_%H-%M-%S).log"
-  touch "$LOGFILE"
-fi
-chmod 600 "$LOGFILE" || true
-exec > >(tee -a "$LOGFILE") 2>&1
-
-g "Logfile / Log: $LOGFILE"
-g "Host: $(hostname)  Kernel: $(uname -r)"
-blank
-
-export DEBIAN_FRONTEND=noninteractive
-
-# Recommended dpkg options for unattended scripts
-APT_GET=(apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
-
-# --- Security repo hint (warning only) ---
-if grep -RqsE 'security\.debian\.org|[-]security' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null; then
-  g "Security-Repo: gefunden (OK)"
-else
-  r "WARNUNG: Kein Security-Repo in APT-Quellen gefunden."
-  r "          APT installiert Security-Updates nur, wenn die Quellen korrekt gesetzt sind."
-fi
-blank
-
-# ---------------- APT UPDATE ----------------
-g "|-> Aktualisiere Paketquellen / Update package lists"
-apt-get update
-g "<-|"
-blank
-
-if [[ "$INSTALL_HELPERS" -eq 1 ]]; then
-  g "|-> Installiere Helfer / Install helpers: needrestart"
-  # needrestart is optional; ignore failure if repo policies block it
-  "${APT_GET[@]}" install needrestart || true
-  g "<-|"
-  blank
+if ! command -v whiptail >/dev/null 2>&1; then
+  r "whiptail ist nicht installiert."
+  y "Installiere es mit:"
+  y "sudo apt update && sudo apt install whiptail -y"
+  exit 3
 fi
 
-# ---------------- APT UPGRADE ----------------
-if [[ "$FULL_UPGRADE" -eq 1 ]]; then
-  g "|-> Vollständiges Upgrade / full-upgrade (kann Pakete entfernen/ersetzen)"
-  "${APT_GET[@]}" full-upgrade
-else
-  g "|-> Installiere Updates / upgrade"
-  "${APT_GET[@]}" upgrade
+HAS_FLATPAK=false
+
+if command -v flatpak >/dev/null 2>&1; then
+  HAS_FLATPAK=true
 fi
-g "<-|"
+
+# ------------------------------------------------------------
+# APT-Paketquellen aktualisieren
+# ------------------------------------------------------------
+
 blank
+g "Aktualisiere APT-Paketquellen..."
+apt update
 
-# ---------------- CLEANUP ----------------
-g "|-> Entferne nicht mehr benötigte Pakete / autoremove (purge)"
-"${APT_GET[@]}" autoremove --purge
-g "<-|"
-blank
+if [ $? -ne 0 ]; then
+  r "APT update ist fehlgeschlagen."
+  exit 4
+fi
 
-g "|-> Bereinige Paket-Cache / clean"
-apt-get clean
-g "<-|"
-blank
+# ------------------------------------------------------------
+# APT-Updates per Checkbox auswählen
+# ------------------------------------------------------------
 
-# ---------------- FLATPAK (optional) ----------------
-if [[ "$DO_FLATPAK" -eq 1 ]]; then
-  r "-----------------------"
-  g "============2=2=2=2=2=2=2=2=2=2=2=2=2=2=2=2=2=2=================="
-  g "Flatpak Updates (optional)                                      #"
-  g "================================================================="
-  blank
+APT_PACKAGES="$(
+  apt list --upgradable 2>/dev/null |
+    awk -F/ 'NR > 1 {print $1}' |
+    sort -u
+)"
 
-  if ! command -v flatpak >/dev/null 2>&1; then
-    g "|-> Flatpak nicht gefunden – installiere Flatpak / installing flatpak"
-    "${APT_GET[@]}" install flatpak
-    g "<-|"
-    blank
-  else
-    g "|-> Flatpak ist bereits installiert / flatpak already installed"
-    g "<-|"
-    blank
+SELECTED_APT_PACKAGES=""
+
+if [ -n "$APT_PACKAGES" ]; then
+  APT_OPTIONS=()
+
+  while IFS= read -r pkg; do
+    [ -z "$pkg" ] && continue
+    APT_OPTIONS+=("$pkg" "APT-Paketupdate" "ON")
+  done <<< "$APT_PACKAGES"
+
+  SELECTED_APT_PACKAGES="$(
+    whiptail \
+      --title "APT Updates auswählen" \
+      --checklist "Mit LEERTASTE Pakete an-/abwählen, mit TAB zu <Ok>, mit ENTER bestätigen." \
+      25 100 15 \
+      "${APT_OPTIONS[@]}" \
+      3>&1 1>&2 2>&3
+  )"
+
+  if [ $? -ne 0 ]; then
+    y "APT-Paketauswahl abgebrochen oder übersprungen."
+    SELECTED_APT_PACKAGES=""
   fi
 
-  # Add flathub if missing
-  if ! flatpak remotes 2>/dev/null | grep -q '^flathub$'; then
-    g "|-> Füge Flathub hinzu / add flathub"
-    flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
-    g "<-|"
-    blank
-  else
-    g "|-> Flathub ist bereits vorhanden / flathub already present"
-    g "<-|"
-    blank
-  fi
-
-  g "|-> Aktualisiere Flatpak-Apps / flatpak update"
-  flatpak update -y || true
-  g "<-|"
-  blank
-fi
-
-# ---------------- POST CHECKS ----------------
-g "================================================================="
-g "System-Update abgeschlossen / Update completed                   #"
-g "================================================================="
-blank
-
-r "     /\    "
-r "    /  \   "
-r "   /    \  "
-r "  /      \ "
-r "  ¯¯¯¯¯¯¯¯ "
-r "  ( ͡° ͜ʖ ͡°)"
-blank
-
-if command -v needrestart >/dev/null 2>&1; then
-  g "|-> needrestart Check (Hinweis auf notwendige Neustarts / hints)"
-  # list-only; do not auto-restart services
-  needrestart -r l || true
-  g "<-|"
-  blank
+  SELECTED_APT_PACKAGES="$(printf "%s" "$SELECTED_APT_PACKAGES" | tr -d '"')"
 else
-  g "Hinweis: needrestart nicht installiert (optional: --helpers)."
+  y "Keine APT-Updates verfügbar."
+fi
+
+# ------------------------------------------------------------
+# Flatpak-Updates per Checkbox auswählen
+# ------------------------------------------------------------
+
+SELECTED_FLATPAK_REFS=""
+
+if [ "$HAS_FLATPAK" = true ]; then
   blank
-fi
+  g "Prüfe Flatpak-Updates..."
 
-# Debian may or may not provide these reboot markers; check both.
-REBOOT_MARKER=0
-if [[ -f /run/reboot-required || -f /var/run/reboot-required ]]; then
-  REBOOT_MARKER=1
-fi
+  FLATPAK_UPDATES="$(
+    flatpak remote-ls --updates --columns=application,branch 2>/dev/null
+  )"
 
-if [[ "$REBOOT_MARKER" -eq 1 ]]; then
-  r "Neustart erforderlich (Marker gefunden) / Reboot required (marker found)."
-  if [[ "$AUTO_REBOOT" -eq 1 ]]; then
-    g "|-> Auto-Reboot aktiv – reboot in 10 Sekunden (Ctrl+C zum Abbrechen)"
-    sleep 10
-    systemctl reboot
+  if [ -n "$FLATPAK_UPDATES" ]; then
+    FLATPAK_OPTIONS=()
+
+    while IFS=$'\t' read -r app branch; do
+      [ -z "$app" ] && continue
+      [ -z "$branch" ] && branch="stable"
+
+      ref="${app}//${branch}"
+      label="${app} (${branch})"
+
+      FLATPAK_OPTIONS+=("$ref" "$label" "ON")
+    done <<< "$FLATPAK_UPDATES"
+
+    SELECTED_FLATPAK_REFS="$(
+      whiptail \
+        --title "Flatpak Updates auswählen" \
+        --checklist "Mit LEERTASTE Pakete an-/abwählen, mit TAB zu <Ok>, mit ENTER bestätigen." \
+        25 100 15 \
+        "${FLATPAK_OPTIONS[@]}" \
+        3>&1 1>&2 2>&3
+    )"
+
+    if [ $? -ne 0 ]; then
+      y "Flatpak-Paketauswahl abgebrochen oder übersprungen."
+      SELECTED_FLATPAK_REFS=""
+    fi
+
+    SELECTED_FLATPAK_REFS="$(printf "%s" "$SELECTED_FLATPAK_REFS" | tr -d '"')"
   else
-    g "Auto-Reboot ist AUS. Bitte bei Gelegenheit neu starten."
+    y "Keine Flatpak-Updates verfügbar."
   fi
 else
-  g "Kein Reboot-Marker gefunden. Ein Neustart kann trotzdem sinnvoll sein (z.B. Kernel/critical libs)."
+  y "Flatpak ist nicht installiert. Flatpak-Updates werden übersprungen."
 fi
 
-g "<|END|>"
+# ------------------------------------------------------------
+# Autoremove / Clean per Checkbox auswählen
+# ------------------------------------------------------------
+
+MAINTENANCE_CHOICES="$(
+  whiptail \
+    --title "Wartung auswählen" \
+    --checklist "Mit LEERTASTE auswählen, was zusätzlich ausgeführt werden soll." \
+    15 85 5 \
+    "autoremove" "Nicht mehr benötigte APT-Pakete entfernen" "ON" \
+    "clean" "APT-Cache bereinigen" "ON" \
+    3>&1 1>&2 2>&3
+)"
+
+if [ $? -ne 0 ]; then
+  y "Wartungsauswahl abgebrochen oder übersprungen."
+  MAINTENANCE_CHOICES=""
+fi
+
+MAINTENANCE_CHOICES="$(printf "%s" "$MAINTENANCE_CHOICES" | tr -d '"')"
+
+# ------------------------------------------------------------
+# Zusammenfassung
+# ------------------------------------------------------------
+
+blank
+g "==================================================="
+g "Zusammenfassung"
+g "==================================================="
+
+if [ -n "$SELECTED_APT_PACKAGES" ]; then
+  g "Ausgewählte APT-Pakete:"
+  for pkg in $SELECTED_APT_PACKAGES; do
+    g "  - $pkg"
+  done
+else
+  y "Keine APT-Pakete ausgewählt."
+fi
+
+blank
+
+if [ -n "$SELECTED_FLATPAK_REFS" ]; then
+  g "Ausgewählte Flatpak-Pakete:"
+  for ref in $SELECTED_FLATPAK_REFS; do
+    g "  - $ref"
+  done
+else
+  y "Keine Flatpak-Pakete ausgewählt."
+fi
+
+blank
+
+if [ -n "$MAINTENANCE_CHOICES" ]; then
+  g "Ausgewählte Wartung:"
+  for action in $MAINTENANCE_CHOICES; do
+    g "  - $action"
+  done
+else
+  y "Keine Wartungsaktionen ausgewählt."
+fi
+
+blank
+
+if [ -z "$SELECTED_APT_PACKAGES" ] &&
+   [ -z "$SELECTED_FLATPAK_REFS" ] &&
+   [ -z "$MAINTENANCE_CHOICES" ]; then
+  y "Nichts ausgewählt. Beende Skript."
+  exit 0
+fi
+
+if ! whiptail \
+  --title "Bestätigung" \
+  --yesno "Ausgewählte Updates und Wartungsaktionen jetzt ausführen?" \
+  10 80; then
+  y "Abgebrochen."
+  exit 0
+fi
+
+# ------------------------------------------------------------
+# APT-Updates installieren
+# ------------------------------------------------------------
+
+if [ -n "$SELECTED_APT_PACKAGES" ]; then
+  blank
+  g "Installiere ausgewählte APT-Updates..."
+
+  for pkg in $SELECTED_APT_PACKAGES; do
+    blank
+    g "Aktualisiere APT-Paket: $pkg"
+
+    if ! apt install --only-upgrade -y "$pkg"; then
+      r "Fehler beim Aktualisieren von APT-Paket: $pkg"
+    fi
+  done
+fi
+
+# ------------------------------------------------------------
+# Flatpak-Updates installieren
+# ------------------------------------------------------------
+
+if [ -n "$SELECTED_FLATPAK_REFS" ]; then
+  blank
+  g "Installiere ausgewählte Flatpak-Updates..."
+
+  for ref in $SELECTED_FLATPAK_REFS; do
+    blank
+    g "Aktualisiere Flatpak-Paket: $ref"
+
+    if ! flatpak update -y "$ref"; then
+      r "Fehler beim Aktualisieren von Flatpak-Paket: $ref"
+    fi
+  done
+fi
+
+# ------------------------------------------------------------
+# Wartung ausführen
+# ------------------------------------------------------------
+
+if selected_in_list "autoremove" "$MAINTENANCE_CHOICES"; then
+  blank
+  g "Entferne nicht mehr benötigte Pakete..."
+
+  if ! apt autoremove -y; then
+    r "APT autoremove ist fehlgeschlagen."
+  fi
+fi
+
+if selected_in_list "clean" "$MAINTENANCE_CHOICES"; then
+  blank
+  g "Bereinige APT-Cache..."
+
+  if ! apt clean; then
+    r "APT clean ist fehlgeschlagen."
+  fi
+fi
+
+blank
+g "==================================================="
+g "Update abgeschlossen."
+g "==================================================="
+
+# ------------------------------------------------------------
+# Reboot-Check
+# ------------------------------------------------------------
+
+if [ -f /var/run/reboot-required ]; then
+  blank
+  y "Ein Neustart ist erforderlich."
+
+  if whiptail \
+    --title "Neustart erforderlich" \
+    --yesno "Das System benötigt einen Neustart. Jetzt neu starten?" \
+    10 70; then
+    g "Starte System neu..."
+    reboot
+  else
+    y "Neustart wurde übersprungen."
+  fi
+fi
+
+exit 0
